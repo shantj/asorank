@@ -450,9 +450,19 @@ class TestLive(unittest.TestCase):
         self.assertTrue(1 <= r["rank"] <= 50 if r["found"] else True)
 
     def test_ranks_are_stable_across_two_calls(self):
+        """Consecutive calls agree to within a slot or two.
+
+        Deliberately NOT assertEqual: Apple's ranking genuinely oscillates
+        between adjacent positions minute to minute (observed #22-#25 for this
+        keyword in a single day), so exact equality made this test fail on a
+        working endpoint. What's worth pinning is that the endpoint isn't
+        returning noise - agreement on found-ness, and a rank that doesn't jump.
+        """
         a = asorank.rank_for("screen time detox", track_id=6768664921)
         b = asorank.rank_for("screen time detox", track_id=6768664921)
-        self.assertEqual(a["rank"], b["rank"])
+        self.assertEqual(a["found"], b["found"])
+        if a["found"]:
+            self.assertLessEqual(abs(a["rank"] - b["rank"]), 3)
 
 
 if __name__ == "__main__":
