@@ -1,0 +1,9 @@
+# One keyword per line. Blank lines and # comments are ignored.
+app blocker
+screen time
+screen time detox
+digital detox
+dopamine detox
+stop doomscrolling
+focus timer
+block social media
