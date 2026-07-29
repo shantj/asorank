@@ -1,9 +1,34 @@
 # One keyword per line. Blank lines and # comments are ignored.
+#
+# A useful starting list mixes three kinds of keyword, because --audit is most
+# informative when it has both walls and openings to compare:
+#   - head terms you probably can't win (app blocker, screen time)
+#   - the words already in your title (screen time detox)
+#   - specific phrases users actually type (stop scrolling, quit doomscrolling)
+
+# head terms - expect "entrenched"
 app blocker
 screen time
+block instagram
+block tiktok
+phone addiction
+
+# terms matching this app's title - expect "ranking" or "winnable-other"
 screen time detox
 digital detox
+
+# long-tail intent phrases - where the openings usually are
 dopamine detox
 stop doomscrolling
+quit doomscrolling
+stop scrolling
+scrolling detox
+break phone addiction
+stop brain rot
+willpower app
+self discipline app
+mindful phone use
+attention span
+digital wellbeing
 focus timer
 block social media

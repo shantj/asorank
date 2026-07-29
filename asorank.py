@@ -7,11 +7,14 @@ No API key, no account, no dependencies. Uses Apple's public iTunes Search API.
 Usage:
     python3 asorank.py --app "SproutGuard" --terms "app blocker,screen time detox"
     python3 asorank.py --id 6768664921 --terms-file terms.txt --country gb --json
+    python3 asorank.py --id 6768664921 --terms-file terms.txt --audit
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
+import statistics
 import sys
 import time
 import urllib.error
@@ -22,6 +25,15 @@ SEARCH_URL = "https://itunes.apple.com/search"
 LOOKUP_URL = "https://itunes.apple.com/lookup"
 UA = "asorank/1.0 (+https://github.com/shantj/asorank)"
 MAX_LIMIT = 200  # Apple's documented ceiling for the search endpoint
+
+# Words too generic to carry ranking weight in a title match test.
+STOPWORDS = frozenset(
+    "a an the for to of my your app apps on in no and or is it with".split()
+)
+# An app with fewer ratings than this has essentially no authority signal.
+NO_AUTHORITY_RATINGS = 10
+# Share of query tokens that must appear in a title to count as a title match.
+TITLE_MATCH_THRESHOLD = 0.5
 
 
 class ApiError(RuntimeError):
@@ -134,6 +146,179 @@ def rank_all(terms, *, delay: float = 0.4, **kw) -> list:
     return out
 
 
+def tokenize(text: str | None) -> list:
+    """Lowercase word tokens, minus stopwords and 1-2 letter fragments."""
+    return [
+        t for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if t not in STOPWORDS and len(t) > 2
+    ]
+
+
+def title_match(term: str, name: str) -> float:
+    """Share of the query's meaningful tokens that appear in an app's title.
+
+    Returns 0.0..1.0. A term made entirely of stopwords returns 0.0 rather than
+    dividing by zero.
+    """
+    qt = tokenize(term)
+    if not qt:
+        return 0.0
+    nt = set(tokenize(name))
+    return sum(1 for t in qt if t in nt) / len(qt)
+
+
+def audit_term(
+    term: str,
+    *,
+    track_id: int | None = None,
+    name: str | None = None,
+    country: str = "us",
+    limit: int = 50,
+    depth: int = 10,
+    my_title: str | None = None,
+) -> dict:
+    """Assess whether a keyword is *winnable*, not just where you currently rank.
+
+    Rank alone can't tell you if you're losing to entrenched incumbents or simply
+    absent from the index. This inspects who actually holds the top `depth` slots:
+
+      top_median_ratings  - how much authority the leaders really have
+      no_authority_slots  - top-`depth` apps with <10 ratings that title-match the
+                            query. Each one is proof that an app with no install
+                            base can hold that slot, so the barrier is metadata.
+      you_title_match     - whether YOUR title carries the query's tokens
+      verdict             - what to do about it
+
+    A keyword with >=1 no_authority_slot and a low title match on your side is the
+    best kind of target: nothing is defending it and the fix is in your control.
+
+    `my_title` is your app's real App Store title. Pass it when using track_id: if
+    the app is outside the top `limit` there is no result row to read the name
+    from, and without it the title match silently reads 0% for exactly the
+    keywords the audit exists to judge.
+    """
+    if (name is None) == (track_id is None):
+        raise ValueError("pass exactly one of name= or track_id=")
+    if depth < 1:
+        raise ValueError("depth must be >= 1")
+
+    res = rank_for(term, name=name, track_id=track_id,
+                   country=country, limit=limit)
+    data = _get(
+        SEARCH_URL,
+        {"term": term, "country": country, "entity": "software",
+         "media": "software", "limit": limit},
+    )
+    results = (data.get("results") or [])[:depth]
+
+    ratings = [(a.get("userRatingCount") or 0) for a in results]
+    weak = [
+        {
+            "pos": i,
+            "name": a.get("trackName") or "",
+            "ratings": a.get("userRatingCount") or 0,
+        }
+        for i, a in enumerate(results, 1)
+        if (a.get("userRatingCount") or 0) < NO_AUTHORITY_RATINGS
+        and title_match(term, a.get("trackName") or "") >= TITLE_MATCH_THRESHOLD
+    ]
+
+    mine = my_title or res.get("matched_name") or name or ""
+    my_match = title_match(term, mine) if mine else 0.0
+
+    if not mine:
+        # No title to compare against - do not fabricate a 0% match, which would
+        # wrongly promote every open keyword to "winnable-metadata".
+        my_match = None
+
+    if res["found"] and res["rank"] is not None and res["rank"] <= depth:
+        verdict = "ranking"
+    elif res["found"]:
+        # Indexed and visible, just below the fold. Metadata is not the blocker
+        # here, so it must not be reported as a metadata opportunity.
+        verdict = "ranking-deep"
+    elif weak and (my_match is not None and my_match < TITLE_MATCH_THRESHOLD):
+        verdict = "winnable-metadata"
+    elif weak:
+        verdict = "winnable-other"
+    elif ratings and statistics.median(ratings) >= 10_000:
+        verdict = "entrenched"
+    else:
+        verdict = "contested"
+
+    return {
+        "term": term,
+        "rank": res["rank"],
+        "found": res["found"],
+        "results_seen": res["results_seen"],
+        "top_median_ratings": int(statistics.median(ratings)) if ratings else 0,
+        "top_min_ratings": min(ratings) if ratings else 0,
+        "no_authority_slots": len(weak),
+        "no_authority_examples": weak[:3],
+        "you_title_match": None if my_match is None else round(my_match, 2),
+        "verdict": verdict,
+    }
+
+
+def audit_all(terms, *, delay: float = 0.4, **kw) -> list:
+    out = []
+    for i, t in enumerate(terms):
+        if i:
+            time.sleep(delay)
+        out.append(audit_term(t, **kw))
+    return out
+
+
+VERDICT_NOTE = {
+    "ranking": "already in the top slots",
+    "ranking-deep": "indexed but below the fold - not a metadata problem",
+    "winnable-metadata": "unowned AND your title misses the words - best targets",
+    "winnable-other": "unowned, but your title already matches - look elsewhere",
+    "entrenched": "held by apps with real install bases - expensive",
+    "contested": "no clear opening, no clear wall",
+}
+
+
+def _fmt_audit(rows: list, depth: int) -> str:
+    width = max([len(r["term"]) for r in rows] + [7])
+    out = [
+        f"{'keyword'.ljust(width)}  rank  top{depth}-med  open  you  verdict",
+        f"{'-' * width}  ----  --------  ----  ---  -------",
+    ]
+    for r in rows:
+        rank = f"#{r['rank']}" if r["found"] else ">50"
+        you = "  ?" if r["you_title_match"] is None else f"{r['you_title_match']:>3.0%}"
+        out.append(
+            f"{r['term'].ljust(width)}  {rank:<4}  {r['top_median_ratings']:>8,}  "
+            f"{r['no_authority_slots']:>4}  {you}  {r['verdict']}"
+        )
+
+    order = ["winnable-metadata", "winnable-other", "ranking", "ranking-deep",
+             "contested", "entrenched"]
+    out.append("")
+    out.append(f"open  = apps in the top {depth} with <{NO_AUTHORITY_RATINGS} ratings whose "
+               "title matches the query")
+    out.append("you   = share of the query's words present in your app's title")
+    out.append("")
+    for v in order:
+        hits = [r for r in rows if r["verdict"] == v]
+        if hits:
+            out.append(f"{len(hits):>3}  {v:<18} {VERDICT_NOTE[v]}")
+
+    best = [r for r in rows if r["verdict"] == "winnable-metadata"]
+    if best:
+        best.sort(key=lambda r: (-r["no_authority_slots"], r["top_median_ratings"]))
+        out.append("")
+        out.append("Start here - nothing with an install base is defending these,")
+        out.append("and the words are missing from your title:")
+        for r in best[:8]:
+            ex = r["no_authority_examples"][0] if r["no_authority_examples"] else None
+            tail = (f"  (e.g. #{ex['pos']} '{ex['name'][:34]}' at "
+                    f"{ex['ratings']} ratings)") if ex else ""
+            out.append(f"  - {r['term']}{tail}")
+    return "\n".join(out)
+
+
 def _fmt_table(rows: list, limit: int) -> str:
     width = max([len(r["term"]) for r in rows] + [7])
     lines = [f"{'keyword'.ljust(width)}  rank", f"{'-' * width}  ----"]
@@ -163,6 +348,10 @@ def main(argv=None) -> int:
     p.add_argument("--delay", type=float, default=0.4,
                    help="seconds between queries (default: 0.4)")
     p.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+    p.add_argument("--audit", action="store_true",
+                   help="also judge whether each keyword is winnable, not just your rank")
+    p.add_argument("--depth", type=int, default=10,
+                   help="how many top slots --audit inspects (default: 10)")
     a = p.parse_args(argv)
 
     if a.terms_file:
@@ -179,6 +368,7 @@ def main(argv=None) -> int:
         return 2
 
     try:
+        my_title = None
         if a.id is not None:
             app = lookup_app(a.id, a.country)
             if app is None:
@@ -188,13 +378,18 @@ def main(argv=None) -> int:
                     file=sys.stderr,
                 )
                 return 3
+            my_title = app.get("trackName")
             if not a.json:
                 print(f"{app.get('trackName')} - {app.get('version')} - "
                       f"{app.get('averageUserRating', 0):.1f}* "
                       f"({app.get('userRatingCount', 0)} ratings)\n")
-        rows = rank_all(
-            terms, delay=a.delay, name=a.app, track_id=a.id,
-            country=a.country, limit=a.limit,
+        rows = (
+            audit_all(terms, delay=a.delay, name=a.app, track_id=a.id,
+                      country=a.country, limit=a.limit, depth=a.depth,
+                      my_title=my_title or a.app)
+            if a.audit else
+            rank_all(terms, delay=a.delay, name=a.app, track_id=a.id,
+                     country=a.country, limit=a.limit)
         )
     except ApiError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -205,6 +400,8 @@ def main(argv=None) -> int:
 
     if a.json:
         print(json.dumps(rows, indent=2))
+    elif a.audit:
+        print(_fmt_audit(rows, a.depth))
     else:
         print(_fmt_table(rows, a.limit))
     return 0

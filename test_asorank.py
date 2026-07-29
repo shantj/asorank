@@ -209,6 +209,151 @@ class TestCli(unittest.TestCase):
         self.assertEqual(captured["terms"], ["app blocker", "screen time"])
 
 
+def fake_results(rows):
+    """rows: list of (trackName, userRatingCount)."""
+    return {"resultCount": len(rows),
+            "results": [{"trackName": n, "trackId": 1000 + i, "userRatingCount": c}
+                        for i, (n, c) in enumerate(rows)]}
+
+
+class TestTokenize(unittest.TestCase):
+    def test_drops_stopwords_and_short_fragments(self):
+        self.assertEqual(asorank.tokenize("Block the Apps for My Phone"),
+                         ["block", "phone"])
+
+    def test_handles_none_and_empty(self):
+        self.assertEqual(asorank.tokenize(None), [])
+        self.assertEqual(asorank.tokenize(""), [])
+
+    def test_punctuation_and_case(self):
+        self.assertEqual(asorank.tokenize("Kael: Quit Doomscrolling."),
+                         ["kael", "quit", "doomscrolling"])
+
+
+class TestTitleMatch(unittest.TestCase):
+    def test_full_and_partial_and_zero(self):
+        self.assertEqual(asorank.title_match("screen time detox",
+                                             "SproutGuard: Screen Time Detox"), 1.0)
+        self.assertEqual(asorank.title_match("stop scrolling",
+                                             "DoomSafe: Stop Scrolling"), 1.0)
+        self.assertEqual(asorank.title_match("stop scrolling",
+                                             "SproutGuard: Screen Time Detox"), 0.0)
+
+    def test_partial_is_fractional(self):
+        # "scrolling detox": 1 of 2 tokens present
+        self.assertAlmostEqual(
+            asorank.title_match("scrolling detox", "SproutGuard: Screen Time Detox"), 0.5)
+
+    def test_all_stopword_query_does_not_divide_by_zero(self):
+        self.assertEqual(asorank.title_match("the app", "Anything"), 0.0)
+
+
+class TestAuditTerm(unittest.TestCase):
+    """The audit's whole value is its verdict. Each branch is pinned."""
+
+    def _audit(self, rows, term, my_title, **kw):
+        # rank_for and the audit's own fetch both go through _get.
+        with mock.patch.object(asorank, "_get", return_value=fake_results(rows)):
+            return asorank.audit_term(term, track_id=999999,
+                                      my_title=my_title, **kw)
+
+    def test_winnable_metadata_when_weak_app_holds_slot_and_title_misses(self):
+        r = self._audit([("DoomSafe: Stop Scrolling", 1)] + [("Big App", 50000)] * 9,
+                        "stop scrolling", "SproutGuard: Screen Time Detox")
+        self.assertEqual(r["verdict"], "winnable-metadata")
+        self.assertEqual(r["no_authority_slots"], 1)
+        self.assertEqual(r["you_title_match"], 0.0)
+
+    def test_high_rating_title_match_is_not_an_open_slot(self):
+        # Same title match, but the holder has real authority -> not "open".
+        r = self._audit([("DoomSafe: Stop Scrolling", 90000)] + [("Big App", 50000)] * 9,
+                        "stop scrolling", "SproutGuard: Screen Time Detox")
+        self.assertEqual(r["no_authority_slots"], 0)
+        self.assertEqual(r["verdict"], "entrenched")
+
+    def test_weak_app_that_does_not_title_match_is_not_an_open_slot(self):
+        # Low ratings alone is not evidence; it must also match the query.
+        r = self._audit([("Unrelated Puzzle Game", 2)] + [("Mid App", 500)] * 9,
+                        "stop scrolling", "SproutGuard: Screen Time Detox")
+        self.assertEqual(r["no_authority_slots"], 0)
+        self.assertEqual(r["verdict"], "contested")
+
+    def test_winnable_other_when_your_title_already_matches(self):
+        r = self._audit([("Tiny Detox", 1)] + [("Mid App", 500)] * 9,
+                        "detox", "SproutGuard: Screen Time Detox")
+        self.assertEqual(r["verdict"], "winnable-other")
+
+    def test_ranking_when_inside_depth(self):
+        rows = [("SproutGuard: Screen Time Detox", 1)] + [("Tiny Detox", 1)] * 9
+        with mock.patch.object(asorank, "_get", return_value=fake_results(rows)):
+            r = asorank.audit_term("detox", track_id=1000,
+                                   my_title="SproutGuard: Screen Time Detox")
+        self.assertEqual(r["rank"], 1)
+        self.assertEqual(r["verdict"], "ranking")
+
+    def test_ranking_deep_is_not_reported_as_a_metadata_opportunity(self):
+        """Found but below depth: metadata is not the blocker, so must not be
+        labelled winnable-metadata even though open slots exist."""
+        rows = ([("DoomSafe: Stop Scrolling", 1)] + [("Filler", 5000)] * 18
+                + [("SproutGuard: Screen Time Detox", 1)])
+        with mock.patch.object(asorank, "_get", return_value=fake_results(rows)):
+            r = asorank.audit_term("stop scrolling", track_id=1019,
+                                   my_title="SproutGuard: Screen Time Detox",
+                                   depth=10)
+        self.assertEqual(r["rank"], 20)
+        self.assertEqual(r["verdict"], "ranking-deep")
+
+    def test_unknown_title_yields_none_not_a_fake_zero(self):
+        """Without a title, a 0% match would wrongly promote every open keyword."""
+        r = self._audit([("DoomSafe: Stop Scrolling", 1)] + [("Big", 50000)] * 9,
+                        "stop scrolling", None)
+        self.assertIsNone(r["you_title_match"])
+        self.assertNotEqual(r["verdict"], "winnable-metadata")
+        self.assertEqual(r["verdict"], "winnable-other")
+
+    def test_depth_is_respected(self):
+        rows = [("Big", 90000)] * 3 + [("DoomSafe: Stop Scrolling", 1)] * 1 \
+            + [("Big", 90000)] * 6
+        shallow = self._audit(rows, "stop scrolling", "X App", depth=3)
+        deep = self._audit(rows, "stop scrolling", "X App", depth=10)
+        self.assertEqual(shallow["no_authority_slots"], 0)
+        self.assertEqual(deep["no_authority_slots"], 1)
+
+    def test_rejects_both_or_neither_identifier(self):
+        with self.assertRaises(ValueError):
+            asorank.audit_term("x", track_id=1, name="y")
+        with self.assertRaises(ValueError):
+            asorank.audit_term("x")
+
+    def test_rejects_bad_depth(self):
+        with self.assertRaises(ValueError):
+            asorank.audit_term("x", track_id=1, depth=0)
+
+    def test_missing_rating_field_defaults_to_zero_not_crash(self):
+        payload = {"resultCount": 1,
+                   "results": [{"trackName": "Stop Scrolling", "trackId": 5}]}
+        with mock.patch.object(asorank, "_get", return_value=payload):
+            r = asorank.audit_term("stop scrolling", track_id=999,
+                                   my_title="SproutGuard")
+        self.assertEqual(r["no_authority_slots"], 1)
+
+
+class TestAuditFormatting(unittest.TestCase):
+    def test_unknown_title_renders_as_question_mark_not_zero_percent(self):
+        rows = [{"term": "x", "rank": None, "found": False, "results_seen": 50,
+                 "top_median_ratings": 100, "top_min_ratings": 0,
+                 "no_authority_slots": 1, "no_authority_examples": [],
+                 "you_title_match": None, "verdict": "winnable-other"}]
+        out = asorank._fmt_audit(rows, 10)
+        self.assertIn("?", out)
+        self.assertNotIn("0%", out)
+
+    def test_every_verdict_has_a_note(self):
+        produced = {"ranking", "ranking-deep", "winnable-metadata",
+                    "winnable-other", "entrenched", "contested"}
+        self.assertEqual(produced, set(asorank.VERDICT_NOTE))
+
+
 class TestLive(unittest.TestCase):
     """Real network. Skipped unless run with --live."""
     def setUp(self):
