@@ -343,6 +343,7 @@ class TestAuditFormatting(unittest.TestCase):
         rows = [{"term": "x", "rank": None, "found": False, "results_seen": 50,
                  "top_median_ratings": 100, "top_min_ratings": 0,
                  "no_authority_slots": 1, "no_authority_examples": [],
+                 "supply": 3, "pool": 50, "supply_share": 0.06,
                  "you_title_match": None, "verdict": "winnable-other"}]
         out = asorank._fmt_audit(rows, 10)
         self.assertIn("?", out)
@@ -350,8 +351,81 @@ class TestAuditFormatting(unittest.TestCase):
 
     def test_every_verdict_has_a_note(self):
         produced = {"ranking", "ranking-deep", "winnable-metadata",
-                    "winnable-other", "entrenched", "contested"}
+                    "winnable-other", "entrenched", "contested", "crowded"}
         self.assertEqual(produced, set(asorank.VERDICT_NOTE))
+
+
+class TestSupply(unittest.TestCase):
+    """Supply = how many apps already own the query's words in their titles.
+
+    Round-12 finding: rank alone cannot distinguish 'nobody is here' from
+    'everybody is here', and those demand opposite actions.
+    """
+
+    @staticmethod
+    def _payload(matching, nonmatching, ratings=50_000):
+        res = [{"trackName": f"Brain Rot Blocker {i}", "trackId": 100 + i,
+                "userRatingCount": ratings} for i in range(matching)]
+        res += [{"trackName": f"Unrelated Thing {i}", "trackId": 900 + i,
+                 "userRatingCount": ratings} for i in range(nonmatching)]
+        return {"resultCount": len(res), "results": res}
+
+    def test_supply_counts_full_pool_not_just_top_depth(self):
+        # 30 title-matchers but only 10 fit in `depth` - supply must see all 30,
+        # otherwise it is capped by depth and can never exceed it.
+        payload = self._payload(30, 20)
+        with mock.patch.object(asorank, "_get", return_value=payload):
+            r = asorank.audit_term("brain rot", track_id=999, depth=10,
+                                   my_title="SproutGuard")
+        self.assertEqual(r["supply"], 30)
+        self.assertEqual(r["pool"], 50)
+        self.assertEqual(r["supply_share"], 0.6)
+
+    def test_crowded_when_most_rivals_already_title_match(self):
+        payload = self._payload(45, 5)
+        with mock.patch.object(asorank, "_get", return_value=payload):
+            r = asorank.audit_term("brain rot", track_id=999, depth=10,
+                                   my_title="SproutGuard")
+        self.assertEqual(r["verdict"], "crowded")
+
+    def test_open_field_is_not_crowded(self):
+        payload = self._payload(3, 47)
+        with mock.patch.object(asorank, "_get", return_value=payload):
+            r = asorank.audit_term("brain rot", track_id=999, depth=10,
+                                   my_title="SproutGuard")
+        self.assertNotEqual(r["verdict"], "crowded")
+
+    def test_crowded_beats_winnable_metadata(self):
+        """The false positive this guard exists to stop.
+
+        A crowded keyword can still show a zero-rating app in the top 10. Without
+        the ordering, that lone weak slot reads as 'winnable-metadata' and tells
+        you to chase a keyword 90% of the field already owns.
+        """
+        payload = self._payload(45, 5)
+        payload["results"][0]["userRatingCount"] = 0  # a weak slot at #1
+        with mock.patch.object(asorank, "_get", return_value=payload):
+            r = asorank.audit_term("brain rot", track_id=999, depth=10,
+                                   my_title="SproutGuard")
+        self.assertGreaterEqual(r["no_authority_slots"], 1)  # weak slot IS there
+        self.assertEqual(r["verdict"], "crowded")            # but does not win
+
+    def test_empty_pool_does_not_divide_by_zero(self):
+        with mock.patch.object(asorank, "_get",
+                               return_value={"resultCount": 0, "results": []}):
+            r = asorank.audit_term("nonsense qqq", track_id=999,
+                                   my_title="SproutGuard")
+        self.assertEqual(r["supply"], 0)
+        self.assertEqual(r["supply_share"], 0.0)
+
+    def test_ranking_verdict_not_overridden_by_crowded(self):
+        """If you already rank, the field being crowded is irrelevant."""
+        payload = self._payload(45, 5)
+        payload["results"][0]["trackId"] = 999  # that's us, at #1
+        with mock.patch.object(asorank, "_get", return_value=payload):
+            r = asorank.audit_term("brain rot", track_id=999, depth=10,
+                                   my_title="SproutGuard")
+        self.assertEqual(r["verdict"], "ranking")
 
 
 class TestLive(unittest.TestCase):

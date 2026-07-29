@@ -100,27 +100,37 @@ reasons to be invisible, and they have opposite responses:
 $ python3 asorank.py --id 6768664921 --terms-file keywords.txt --audit
 SproutGuard: Screen Time Detox - 2.3.1 - 5.0* (1 ratings)
 
-keyword                rank  top10-med  open  you  verdict
----------------------  ----  --------  ----  ---  -------
-screen time detox      #24      1,402     4  100%  winnable-other
-stop scrolling         >50        351     2   0%  winnable-metadata
-quit doomscrolling     >50        997     4   0%  winnable-metadata
-break phone addiction  >50      2,968     2   0%  winnable-metadata
-app blocker            >50     11,071     0   0%  entrenched
-block instagram        >50     42,186     0   0%  entrenched
+keyword             rank  top10-med  supply  open  you  verdict
+------------------  ----  --------  ------  ----  ---  -------
+screen time detox   #24      1,404  159/199     4  100%  ranking-deep
+stop doomscrolling  >50         22   30/175     3   0%  winnable-metadata
+brain rot           >50      1,459   66/172     0   0%  contested
+app blocker         >50     11,071   92/186     0   0%  entrenched
+screen time         >50     20,688  168/193     0  100%  crowded
+focus timer         >50      5,781  183/195     0   0%  crowded
+scroll less         >50         44   60/166     1   0%  winnable-metadata
 
+supply= apps in the result pool whose title already matches the query
 open  = apps in the top 10 with <10 ratings whose title matches the query
 you   = share of the query's words present in your app's title
 ```
 
-**`open` is the column that matters.** Each open slot is an existence proof: an app with
-no install base is holding that position right now, so the position is not defended by
-authority. `entrenched` keywords have zero of them.
+**`open` and `supply` are the columns that matter, and they answer different questions.**
+
+`open` is an existence proof: an app with no install base is holding that position right
+now, so the position is not defended by authority. `entrenched` keywords have zero.
+
+`supply` is the *size of the field* — how many apps already carry the query's words in
+their titles. This is what `open` alone cannot see. `focus timer` has 183 title-matchers
+out of 195 results: putting those words in your title makes you the 184th identical
+match, and the tiebreak falls back to install base, which is the thing you don't have.
+`stop doomscrolling` has 30 out of 175. Same `>50` rank, opposite correct response.
 
 | Verdict | Meaning |
 |---|---|
 | `winnable-metadata` | Unowned, and your title misses the words. **Best targets.** |
 | `winnable-other` | Unowned, but your title already matches — something else is wrong. |
+| `crowded` | Most rivals already title-match. Metadata won't break in. |
 | `ranking` | You're in the top `--depth`. |
 | `ranking-deep` | Indexed but below the fold. Not a metadata problem. |
 | `contested` | No clear opening, no clear wall. |
@@ -138,6 +148,33 @@ Across 380 top-10 slots sampled over 38 keywords, title-matching apps had a medi
 direction from what an authority-driven ranking would produce. 8% of all top-10 slots
 were held by apps with under 10 ratings.
 
+### The within-app control (why this isn't just correlation)
+
+The 380-slot sample above compares *different apps*, so authority and title could still
+be confounded. A follow-up test held the app constant instead — 71 live queries against
+one app (`SproutGuard`, 1 rating), same store, same day, so the only variable is the query:
+
+| query set | n | ranked in top 50 |
+|---|---|---|
+| every permutation of the app's own title tokens, brand token included | 49 | **49 / 49** |
+| the same generic tokens with the brand word removed | 22 | **3 / 22** |
+
+And the falsification arm, which is the useful part: seven phrases taken **verbatim from
+that app's own App Store description** but absent from its title —
+`doomscrolling`, `block apps`, `stay focused`, `focus rules`, `screen habits`,
+`healthier screen habits`, `apple screen time`.
+
+**0 of 7 ranked at any depth, top-200.** Not "ranked poorly" — absent from the index.
+
+The practical takeaway: **your long description is approximately inert for search.** Words
+that aren't in your title or subtitle largely don't exist to the ranker. That app's
+description opens with the literal word "doomscrolling" and the app is invisible for it.
+
+This also explains what `supply` measures. Generic tokens fail not because the ranker
+excludes small apps, but because you're outnumbered: `screen` appears in 155 of 182
+result titles, `time` in 148 of 170. `brain rot` appears in 5 of 172. The `crowded`
+threshold sits in the empty gap between those two clusters.
+
 This is a heuristic over a public endpoint, not a model of Apple's ranker. It won't tell
 you search volume — a wide-open keyword nobody searches for is still worthless, and
 `--audit` cannot see that. Use it to rule keywords **out** cheaply, then judge demand
@@ -152,10 +189,11 @@ rank_for("app blocker", track_id=6768664921)
 # {'term': 'app blocker', 'rank': None, 'found': False,
 #  'results_seen': 50, 'matched_name': None}
 
-audit_term("stop scrolling", track_id=6768664921,
+audit_term("stop scrolling", track_id=6768664921, limit=200,
            my_title="SproutGuard: Screen Time Detox")
 # {'term': 'stop scrolling', 'rank': None, 'found': False, ...
-#  'top_median_ratings': 351, 'no_authority_slots': 2,
+#  'top_median_ratings': 342, 'no_authority_slots': 2,
+#  'supply': 36, 'pool': 182, 'supply_share': 0.2,
 #  'you_title_match': 0.0, 'verdict': 'winnable-metadata'}
 ```
 

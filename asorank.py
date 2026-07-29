@@ -34,6 +34,14 @@ STOPWORDS = frozenset(
 NO_AUTHORITY_RATINGS = 10
 # Share of query tokens that must appear in a title to count as a title match.
 TITLE_MATCH_THRESHOLD = 0.5
+# Share of the result pool already title-matching the query, above which adding
+# the words to your own title just makes you one more identical matcher and the
+# tiebreak falls back to install base. Calibrated against live measurements:
+# 'screen' 155/182 (85%), 'time' 148/170 (87%), 'scroll' 124/176 (70%) and
+# 'detox' 107/193 (55%) are all keywords a 1-rating app cannot enter, while
+# 'doomscroll' 28/167 (17%) and 'brain rot' 5/172 (3%) have live top-10 slots
+# held by 0-rating apps. 0.5 sits in the empty gap between those two clusters.
+CROWDED_SUPPLY_SHARE = 0.5
 
 
 class ApiError(RuntimeError):
@@ -212,6 +220,22 @@ def audit_term(
     results = (data.get("results") or [])[:depth]
 
     ratings = [(a.get("userRatingCount") or 0) for a in results]
+
+    # Supply: how many apps in the whole result pool carry the query's tokens in
+    # their title. This is the discriminator rank alone hides. Two keywords can
+    # both show you at >50 for opposite reasons: 150 rivals already own the words
+    # (you are outnumbered, metadata will not save you), or 5 do (the field is
+    # empty and the words are simply missing from your title). Measured on the
+    # full pool, not the top `depth`, because the depth slice is the *outcome* of
+    # the competition and cannot measure its size.
+    all_results = data.get("results") or []
+    supply = sum(
+        1 for a in all_results
+        if title_match(term, a.get("trackName") or "") >= TITLE_MATCH_THRESHOLD
+    )
+    pool = len(all_results)
+    supply_share = (supply / pool) if pool else 0.0
+
     weak = [
         {
             "pos": i,
@@ -237,6 +261,13 @@ def audit_term(
         # Indexed and visible, just below the fold. Metadata is not the blocker
         # here, so it must not be reported as a metadata opportunity.
         verdict = "ranking-deep"
+    elif supply_share >= CROWDED_SUPPLY_SHARE:
+        # The words are already in most rivals' titles. Adding them to yours makes
+        # you one of N identical matchers and the tiebreak reverts to authority,
+        # which is the thing you do not have. Checked BEFORE the weak-slot test:
+        # a crowded keyword can still show a no-authority slot, and calling that
+        # "winnable-metadata" is the exact false positive this guard exists to stop.
+        verdict = "crowded"
     elif weak and (my_match is not None and my_match < TITLE_MATCH_THRESHOLD):
         verdict = "winnable-metadata"
     elif weak:
@@ -255,6 +286,9 @@ def audit_term(
         "top_min_ratings": min(ratings) if ratings else 0,
         "no_authority_slots": len(weak),
         "no_authority_examples": weak[:3],
+        "supply": supply,
+        "pool": pool,
+        "supply_share": round(supply_share, 2),
         "you_title_match": None if my_match is None else round(my_match, 2),
         "verdict": verdict,
     }
@@ -274,6 +308,7 @@ VERDICT_NOTE = {
     "ranking-deep": "indexed but below the fold - not a metadata problem",
     "winnable-metadata": "unowned AND your title misses the words - best targets",
     "winnable-other": "unowned, but your title already matches - look elsewhere",
+    "crowded": "most rivals already title-match - metadata won't break in",
     "entrenched": "held by apps with real install bases - expensive",
     "contested": "no clear opening, no clear wall",
 }
@@ -282,20 +317,22 @@ VERDICT_NOTE = {
 def _fmt_audit(rows: list, depth: int) -> str:
     width = max([len(r["term"]) for r in rows] + [7])
     out = [
-        f"{'keyword'.ljust(width)}  rank  top{depth}-med  open  you  verdict",
-        f"{'-' * width}  ----  --------  ----  ---  -------",
+        f"{'keyword'.ljust(width)}  rank  top{depth}-med  supply  open  you  verdict",
+        f"{'-' * width}  ----  --------  ------  ----  ---  -------",
     ]
     for r in rows:
         rank = f"#{r['rank']}" if r["found"] else ">50"
         you = "  ?" if r["you_title_match"] is None else f"{r['you_title_match']:>3.0%}"
+        sup = f"{r['supply']:>3}/{r['pool']:<3}"
         out.append(
             f"{r['term'].ljust(width)}  {rank:<4}  {r['top_median_ratings']:>8,}  "
-            f"{r['no_authority_slots']:>4}  {you}  {r['verdict']}"
+            f"{sup}  {r['no_authority_slots']:>4}  {you}  {r['verdict']}"
         )
 
     order = ["winnable-metadata", "winnable-other", "ranking", "ranking-deep",
-             "contested", "entrenched"]
+             "contested", "crowded", "entrenched"]
     out.append("")
+    out.append(f"supply= apps in the result pool whose title already matches the query")
     out.append(f"open  = apps in the top {depth} with <{NO_AUTHORITY_RATINGS} ratings whose "
                "title matches the query")
     out.append("you   = share of the query's words present in your app's title")
